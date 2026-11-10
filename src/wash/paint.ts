@@ -15,18 +15,57 @@ const clamp01 = (x: number) => (x < 0 ? 0 : x > 1 ? 1 : x)
 interface Slot {
   worker: Worker
   load: number
+  // Running while it has work: how long it may go without answering
+  timer?: ReturnType<typeof setTimeout>
 }
 
-interface Pending {
+interface Job {
+  w: number
+  h: number
+  opts: FieldOptions
   resolve: (pixels: Uint8ClampedArray) => void
-  load: number
+  reject: (error: unknown) => void
   slot: Slot
 }
 
 const WORKER_COUNT = Math.min(2, navigator.hardwareConcurrency || 1)
-const pending = new Map<number, Pending>()
+// The biggest field takes a worker about a second on a slow phone. One with work that says
+// nothing for this long has died without an error (closed for memory, say)
+export const WORKER_SILENCE_MS = 15_000
+const pending = new Map<number, Job>()
 let workers: Slot[] | null = null
 let nextId = 0
+
+// Painted here when no worker can: a throw rejects, rather than escaping whoever asked
+const onMainThread = (w: number, h: number, opts: FieldOptions) =>
+  new Promise<Uint8ClampedArray>((resolve) => resolve(renderField(w, h, opts)))
+
+// Done with a job: with its worker's pixels, or painted here when its worker failed
+const settle = (id: number, pixels?: Uint8ClampedArray) => {
+  const job = pending.get(id)
+  if (!job) return
+  pending.delete(id)
+  job.slot.load -= job.w * job.h
+  if (pixels) job.resolve(pixels)
+  else onMainThread(job.w, job.h, job.opts).then(job.resolve, job.reject)
+}
+
+// A worker that didn't load, threw, sent what couldn't be read or went silent gets no
+// more work, and what it held is painted here. Once none are left, everything is
+const retire = (slot: Slot) => {
+  clearTimeout(slot.timer)
+  slot.worker.terminate()
+  workers = workers?.filter((s) => s !== slot) ?? null
+  pending.forEach((job, id) => {
+    if (job.slot === slot) settle(id)
+  })
+}
+
+// Each answer starts the wait again, so a long queue on a working worker never runs out
+const watch = (slot: Slot) => {
+  clearTimeout(slot.timer)
+  slot.timer = slot.load > 0 ? setTimeout(() => retire(slot), WORKER_SILENCE_MS) : undefined
+}
 
 const startWorkers = (): Slot[] => {
   try {
@@ -34,12 +73,13 @@ const startWorkers = (): Slot[] => {
       const worker = new Worker(new URL('./worker.ts', import.meta.url), { type: 'module' })
       const slot: Slot = { worker, load: 0 }
       worker.onmessage = ({ data }: MessageEvent<{ id: number; pixels: Uint8ClampedArray }>) => {
-        const job = pending.get(data.id)
-        if (!job) return
-        pending.delete(data.id)
-        job.slot.load -= job.load
-        job.resolve(data.pixels)
+        settle(data.id, data.pixels)
+        watch(slot)
       }
+      // Neither says which job it was, so it's all of them: a script that never loaded, an
+      // uncaught throw, or an answer that arrived unreadable
+      worker.onerror = () => retire(slot)
+      worker.onmessageerror = () => retire(slot)
       return slot
     })
   } catch {
@@ -49,13 +89,14 @@ const startWorkers = (): Slot[] => {
 
 export const requestField = (w: number, h: number, opts: FieldOptions): Promise<Uint8ClampedArray> => {
   workers ??= startWorkers()
-  if (workers.length === 0) return Promise.resolve(renderField(w, h, opts))
+  if (workers.length === 0) return onMainThread(w, h, opts)
   const slot = workers.reduce((a, b) => (b.load < a.load ? b : a))
   const id = nextId++
-  const load = w * h
-  slot.load += load
-  return new Promise((resolve) => {
-    pending.set(id, { resolve, load, slot })
+  slot.load += w * h
+  return new Promise((resolve, reject) => {
+    pending.set(id, { w, h, opts, resolve, reject, slot })
+    // Started by the first job only: a dead worker handed a steady stream must still run out
+    if (!slot.timer) watch(slot)
     slot.worker.postMessage({ id, w, h, opts })
   })
 }
@@ -250,5 +291,9 @@ export const renderBlot = (avatarSeed: string, pigment: Pigment, size: number) =
     return c.toDataURL('image/png')
   })
   blotCache.set(key, job)
+  // One that failed is painted again the next time it's asked for, not kept as a failure
+  job.catch(() => {
+    if (blotCache.get(key) === job) blotCache.delete(key)
+  })
   return job
 }
