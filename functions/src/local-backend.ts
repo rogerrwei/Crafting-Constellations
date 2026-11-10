@@ -108,6 +108,7 @@ export const startLocalBackend = async () => {
   const { handleNewReport } = await import('./reports.js')
   const { mirrorFriendshipOf, noticeOnAccept } = await import('./friendships.js')
   const { finishRefreshes } = await import('./admin.js')
+  const { removeExpired } = await import('./housekeeping.js')
 
   const ignoreMissing = (error: { code?: number }) => {
     if (error.code !== NOT_FOUND) throw error
@@ -315,14 +316,15 @@ export const startLocalBackend = async () => {
     watch('comments', db.collectionGroup('comments'), parentsOnChange(recountPosts, allPosts)),
   ]
 
-  // Housekeeping: a failure waits for the next round, and never ends the process. Also a profile
-  // reset whose new name a failure, or a stop, left off the writing they had out (finishResets
-  // does this on Cloud Functions)
+  // Housekeeping: a failure waits for the next round, and never ends the process. Also, as the
+  // housekeeping function does on Cloud Functions: a profile reset whose new name a failure, or a
+  // stop, left off the writing they had out, and records past their expireAt
   const cleanUpCalls = () => {
     void removeStaleCalls().catch((error: unknown) => log('cleanup failed:', error))
     void finishRefreshes()
       .then((finished) => finished > 0 && log(`finished ${finished} profile reset(s) left undone`))
       .catch((error: unknown) => log('finishing profile resets failed:', error))
+    void removeExpired().catch((error: unknown) => log('removing expired records failed:', error))
   }
   const cleanup = setInterval(cleanUpCalls, CALL_CLEANUP_EVERY_MS)
   cleanUpCalls()

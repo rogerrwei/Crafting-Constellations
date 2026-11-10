@@ -17,5 +17,5 @@ export {
   setAdmin,
   bootstrapAdmin,
   createGroup,
-  finishResets,
 } from './admin.js'
+export { housekeeping } from './housekeeping.js'

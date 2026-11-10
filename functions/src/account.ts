@@ -5,7 +5,7 @@ import { auth, closeAll, db, logAction, storage } from './app.js'
 import { callable } from './options.js'
 
 // How long the mark that an account is leaving outlasts the deletion: longer than a call already on
-// its way, or a sign-in token (an hour), can still act for it. Firestore's TTL policy removes it after
+// its way, or a sign-in token (an hour), can still act for it. Housekeeping removes it after
 const LEAVING_FOR_MS = 24 * 60 * 60_000
 
 const refsOf = async (query: Query) => (await query.get()).docs.map((d) => d.ref)

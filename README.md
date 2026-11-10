@@ -66,7 +66,7 @@ npm run test:local-backend
 - `npm test` covers the moderation rules, the constellation layout, the account-deletion rules, and helpers.
 - `npm run test:rules` runs the Firestore and Storage security rules against the emulators.
 - `npm run test:e2e` runs account deletion (function, triggers, Storage, and a save that lands after it), a moderator's profile reset, a moderator's licence review, removing a moderator (in the app and with `grant-admin`), and chat and group names end to end against the emulators.
-- `npm run test:local-backend` runs the local backend (below) against the emulators, with no Functions emulator, including how it copes when stopped mid-call, when Auth fails, or with no Storage; plus a rename racing a moderator's profile reset, reporting rounds after a moderator's decision, reports naming a path Firestore can't read, pen names copied in lookalike letters (in either order), a moderator's profile reset (the name it gives, and finishing it after a failure part way), the one-off `clear-moderator-ids` and `backfill-pen-name-shapes` scripts, and the Cloud Functions counter triggers counting a retried or replayed event once (each event leaves a `counterEvents` marker, cleared by a TTL policy on `expireAt` that `firestore.indexes.json` sets up).
+- `npm run test:local-backend` runs the local backend (below) against the emulators, with no Functions emulator, including how it copes when stopped mid-call, when Auth fails, or with no Storage; plus a rename racing a moderator's profile reset, reporting rounds after a moderator's decision, reports naming a path Firestore can't read, pen names copied in lookalike letters (in either order), a moderator's profile reset (the name it gives, and finishing it after a failure part way), the one-off `clear-moderator-ids` and `backfill-pen-name-shapes` scripts, and the Cloud Functions counter triggers counting a retried or replayed event once (each event leaves a `counterEvents` marker), and housekeeping removing expired records.
 
 Stop `npm run emulators` before the last three; they use the same ports.
 
@@ -177,7 +177,7 @@ npx firebase hosting:channel:deploy preview --expires 7d --project prod
 
 While the project can't use Cloud Functions, a small program on our own machine does their work: `functions/src/local-backend.ts`.
 - **How the site reaches it:** with `VITE_LOCAL_BACKEND=true`, the site writes each call (pen name, admin actions, account deletion) to `calls/{id}`. The backend runs the same callable code and writes the answer back. The rules check the caller and their sign-in time.
-- **What else it does:** it watches Firestore for what the triggers did (moderating new writing, reports, friendships, counters). Every 10 minutes it also finishes any profile reset whose new name a failure or a stop left off the writing the person already had out (`finishResets` does this on Cloud Functions).
+- **What else it does:** it watches Firestore for what the triggers did (moderating new writing, reports, friendships, counters). Every 10 minutes it also finishes any profile reset whose new name a failure or a stop left off the writing the person already had out, and removes records past their `expireAt` (the `housekeeping` function does both on Cloud Functions). Firestore's own TTL policies would do the second, but they need billing on the project.
 - **No inbound ports:** it only makes outgoing connections, so no ports, tunnel or domain are needed.
 - **Restarts:** stopping lets calls under way finish (up to 60s) and answers any still going as interrupted, so the site stops waiting. After a restart, it catches up on anything that arrived while it was off.
 - **Not available:** licence uploads need Storage, so they're paused (the Professional page says so).
@@ -287,7 +287,7 @@ People can change their answer under **You → Account**. An answer reaches ever
 - their licence application and documents, and their posting-rate stamps;
 - the sign-in itself.
 
-Before removing anything it marks the account as leaving (`accountDeletions/{uid}`). A tab left open still holds a sign-in token for up to an hour, and a save already on its way may have asked Auth before the account went: `saveProfile` reads the mark and gives up, and the rules refuse every write from that account. The mark expires after a day, by a TTL policy on `expireAt` that `firestore.indexes.json` sets up.
+Before removing anything it marks the account as leaving (`accountDeletions/{uid}`). A tab left open still holds a sign-in token for up to an hour, and a save already on its way may have asked Auth before the account went: `saveProfile` reads the mark and gives up, and the rules refuse every write from that account. The mark expires after a day; housekeeping removes it.
 
 Ban records and the audit log stay; the audit row holds ids and counts only. A pen name a moderator retired with "Reset profile" stays blocked, in every spelling that passes for it, so nobody can take it again; that record is the name alone, with nothing that points to the account. Moderators can't delete themselves; another moderator has to remove their role first (see Moderators).
 
