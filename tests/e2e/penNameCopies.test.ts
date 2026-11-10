@@ -28,6 +28,7 @@ beforeAll(async () => {
 })
 
 const claim = async (lower: string) => (await db.doc(`penNames/${lower}`).get()).data()
+const passesFor = async (shape: string) => (await db.doc(`penNameShapes/${shape}`).get()).data()
 
 // Names end in this run's number, so a second run on the same emulators starts clean
 const n = Math.floor(Math.random() * 900 + 100)
@@ -52,6 +53,8 @@ const HOPE = '\u041d\u043e\u0440\u0435'
 const COCO = '\u0421\u043e\u0441\u043e'
 const KAY = '\u041a\u0430\u0443'
 const APOSTROPHE = '\u02bc'
+// Cyrillic letters drawn as J, o and e, all one alphabet as a name must be
+const JOE = '\u0408\u043e\u0435'
 // "José" with an acute on the Cyrillic e, and "Jöy" with the Cyrillic o that has a diaeresis
 const JOSE = '\u0408\u043e\u0455\u0435\u0301'
 const JOY_DIAERESIS = '\u0408\u04e7\u0443'
@@ -94,6 +97,8 @@ describe('a name drawn the same as someone else’s', () => {
     const earlier = await person(`${COCO} ${n}`)
     await expect(save(earlier, { penName: `${COCO} ${n}`, note: 'Still here' })).resolves.toMatchObject({ ok: true })
     expect(await claim(`${COCO} ${n}`.toLowerCase())).toEqual({ uid: earlier })
+    // The name it passes for stays with nobody: the plain spelling is someone else's
+    expect(await passesFor(`coco ${n}`)).toBeUndefined()
   })
 
   it('is the person’s own when the name it copies is theirs', async () => {
@@ -108,5 +113,53 @@ describe('a name drawn the same as someone else’s', () => {
     const anna = await person()
     // Cyrillic н is drawn as a small capital, not an n
     await expect(save(anna, { penName: `\u0410\u043d\u043d\u0430 ${n}` })).resolves.toMatchObject({ ok: true })
+  })
+})
+
+describe('the plain spelling of a name someone already has in lookalike letters', () => {
+  it('is refused as taken, and claims nothing', async () => {
+    const first = await person()
+    await expect(save(first, { penName: `Meg O${APOSTROPHE}Neil ${n}` })).resolves.toMatchObject({ ok: true })
+    const second = await person()
+    await expect(save(second, { penName: `${JOE} ${n}` })).resolves.toMatchObject({ ok: true })
+    expect(await passesFor(`meg o'neil ${n}`)).toEqual({ uid: first })
+    expect(await passesFor(`joe ${n}`)).toEqual({ uid: second })
+
+    const copier = await person()
+    await expect(save(copier, { penName: `Meg O'Neil ${n}` })).rejects.toMatchObject({ code: 'already-exists', details: { problem: 'taken' } })
+    await expect(save(copier, { penName: `JOE ${n}` })).rejects.toMatchObject({ code: 'already-exists', details: { problem: 'taken' } })
+    expect(await claim(`meg o'neil ${n}`)).toBeUndefined()
+    expect(await claim(`joe ${n}`)).toBeUndefined()
+    expect((await db.doc(`users/${copier}`).get()).exists).toBe(false)
+  })
+
+  it('goes to only one of two people claiming the two spellings at once', async () => {
+    const [a, b] = [await person(), await person()]
+    const results = await Promise.allSettled([save(a, { penName: `Ida O${APOSTROPHE}Hara ${n}` }), save(b, { penName: `Ida O'Hara ${n}` })])
+    expect(results.filter((result) => result.status === 'fulfilled')).toHaveLength(1)
+    const winner = results[0].status === 'fulfilled' ? a : b
+    expect(await passesFor(`ida o'hara ${n}`)).toEqual({ uid: winner })
+  })
+
+  it('can be had once the first renames', async () => {
+    const first = await person()
+    await save(first, { penName: `Ned O${APOSTROPHE}Day ${n}` })
+    await save(first, { penName: `Plain Moth ${n}` })
+    expect(await passesFor(`ned o'day ${n}`)).toBeUndefined()
+    expect(await passesFor(`plain moth ${n}`)).toEqual({ uid: first })
+
+    const second = await person()
+    await expect(save(second, { penName: `Ned O'Day ${n}` })).resolves.toMatchObject({ ok: true })
+    expect(await passesFor(`ned o'day ${n}`)).toEqual({ uid: second })
+  })
+
+  it('stays with its owner when they save it again, or change only its spelling', async () => {
+    const owner = await person()
+    await save(owner, { penName: `Eve O${APOSTROPHE}Shea ${n}` })
+    await expect(save(owner, { penName: `Eve O${APOSTROPHE}Shea ${n}`, note: 'Hello' })).resolves.toMatchObject({ ok: true })
+    await expect(save(owner, { penName: `Eve O'Shea ${n}` })).resolves.toMatchObject({ ok: true })
+    expect(await passesFor(`eve o'shea ${n}`)).toEqual({ uid: owner })
+    expect(await claim(`eve o'shea ${n}`)).toEqual({ uid: owner })
+    expect(await claim(`eve o${APOSTROPHE}shea ${n}`)).toBeUndefined()
   })
 })

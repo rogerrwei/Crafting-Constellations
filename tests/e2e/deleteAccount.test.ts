@@ -323,7 +323,7 @@ describe('deleteAccount', () => {
     expect(await exists(`penNames/quiet fern ${w.n}`)).toBe(false)
   })
 
-  it('takes away a profile a tab left open made while the purge ran', async () => {
+  it('turns away a profile a tab left open tries to make while the purge runs', async () => {
     const w = await seed()
     const recursiveDelete = handlers.db.recursiveDelete.bind(handlers.db)
     let saved: unknown
@@ -331,14 +331,33 @@ describe('deleteAccount', () => {
     // name, and saves the one it was given while the account is still there
     vi.spyOn(handlers.db, 'recursiveDelete').mockImplementationOnce(async (ref, writer) => {
       await recursiveDelete(ref, writer)
-      saved = await handlers.saveProfile.run(fromTab(w.leaver, { penName: `Quiet Fern ${w.n}` }))
+      saved = await handlers.saveProfile.run(fromTab(w.leaver, { penName: `Quiet Fern ${w.n}` })).catch((error: unknown) => error)
     })
 
     await expect(handlers.deleteAccount.run(fromTab(w.leaver, { confirm: w.leaverName }))).resolves.toMatchObject({ ok: true })
-    expect(saved).toMatchObject({ ok: true })
+    expect(saved).toMatchObject({ code: 'unauthenticated' })
     expect(await exists(`users/${w.leaver}`)).toBe(false)
     expect(await exists(`penNames/quiet fern ${w.n}`)).toBe(false)
+    expect(await exists(`penNameShapes/quiet fern ${w.n}`)).toBe(false)
     await expect(adminAuth.getUser(w.leaver)).rejects.toMatchObject({ code: 'auth/user-not-found' })
+  })
+
+  it('turns away a rename that asked Auth before the deletion and lands after it finished', async () => {
+    const w = await seed()
+    const runTransaction = handlers.db.runTransaction.bind(handlers.db)
+    // The rename has passed its checks (Auth still knew them) and waits; the whole deletion
+    // happens, its last look finds no profile, and then the rename's transaction runs
+    vi.spyOn(handlers.db, 'runTransaction').mockImplementationOnce((async (update: Parameters<Firestore['runTransaction']>[0]) => {
+      await expect(handlers.deleteAccount.run(fromTab(w.leaver, { confirm: w.leaverName }))).resolves.toMatchObject({ ok: true })
+      expect(await exists(`users/${w.leaver}`)).toBe(false)
+      return runTransaction(update)
+    }) as Firestore['runTransaction'])
+
+    await expect(handlers.saveProfile.run(fromTab(w.leaver, { penName: `Quiet Fern ${w.n}`, note: 'Back again' }))).rejects.toMatchObject({ code: 'unauthenticated' })
+    expect(await exists(`users/${w.leaver}`)).toBe(false)
+    expect(await exists(`penNames/quiet fern ${w.n}`)).toBe(false)
+    expect(await exists(`penNameShapes/quiet fern ${w.n}`)).toBe(false)
+    expect(await exists(`penNames/leaving lark ${w.n}`)).toBe(false)
   })
 
   // Between the purge's first step and its last a moderator may still act on them
@@ -422,9 +441,12 @@ describe('Reset profile', () => {
 
     // Leaving frees the name they had at the end. The retired one stays blocked, and nothing in it points back at them.
     await signInAs(w.leaver)
+    expect((await db.doc(`penNameShapes/${fresh.toLowerCase()}`).get()).data()).toEqual({ uid: w.leaver })
     await expect(deleteAccount({ confirm: fresh })).resolves.toMatchObject({ data: { ok: true } })
     expect(await exists(`penNames/${fresh.toLowerCase()}`)).toBe(false)
+    expect(await exists(`penNameShapes/${fresh.toLowerCase()}`)).toBe(false)
     expect((await db.doc(`penNames/leaving lark ${w.n}`).get()).data()).toEqual({ retired: true })
+    expect((await db.doc(`penNameShapes/leaving lark ${w.n}`).get()).data()).toEqual({ retired: true })
     await signInAs(w.friend)
     expect(await problemOf(saveProfile({ penName: w.leaverName }))).toEqual(refused)
   })

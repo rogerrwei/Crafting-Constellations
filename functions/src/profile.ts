@@ -1,11 +1,10 @@
-import { FieldValue } from 'firebase-admin/firestore'
+import { FieldValue, type Transaction } from 'firebase-admin/firestore'
 import { HttpsError, onCall } from 'firebase-functions/v2/https'
 import { auth, db, PIGMENTS } from './app.js'
 import { userOrNone } from './localBackendPolicy.js'
 import { checkPenName, moderate, suggestPenName, tidyPenName } from './moderation/index.js'
-import { penNameShape } from './moderation/penName.js'
 import { callable } from './options.js'
-import { mayRelease } from './profilePolicy.js'
+import { barredBy, firstFree, generatedNames, mayRelease, shapeOf } from './profilePolicy.js'
 
 interface SaveProfileInput {
   penName?: string
@@ -13,13 +12,23 @@ interface SaveProfileInput {
   pigment?: string
 }
 
+// A made-up name nobody holds, by its key or by the name it passes for. Read in the transaction
+// that gives it (Reset profile), or before saveProfile's, which checks it again
+export const freeName = async (read: Pick<Transaction, 'get'> | undefined, skip: ReadonlySet<string> = new Set()) => {
+  const get = (path: string) => (read ? read.get(db.doc(path)) : db.doc(path).get())
+  return firstFree(generatedNames(suggestPenName), async (name) => {
+    const key = name.toLowerCase()
+    const shape = shapeOf(name) ?? key
+    if (skip.has(key) || skip.has(shape)) return false
+    const [claim, copy] = await Promise.all([get(`penNames/${key}`), get(`penNameShapes/${shape}`)])
+    return !claim.exists && !copy.exists
+  })
+}
+
 const pickFreeName = async () => {
-  for (let i = 0; i < 12; i++) {
-    const name = i < 6 ? suggestPenName() : `${suggestPenName()} ${Math.floor(Math.random() * 90 + 10)}`
-    const taken = await db.doc(`penNames/${name.toLowerCase()}`).get()
-    if (!taken.exists) return name
-  }
-  throw new HttpsError('resource-exhausted', 'Could not find a free pen name. Try one of your own.')
+  const name = await freeName(undefined)
+  if (!name) throw new HttpsError('resource-exhausted', 'Could not find a free pen name. Try one of your own.')
+  return name
 }
 
 // The only writer of users/{uid}: validates, moderates, and keeps names unique
@@ -64,25 +73,37 @@ export const saveProfile = onCall<SaveProfileInput>(callable(), async (request) 
   const saved = await db.runTransaction(async (tx) => {
     // Read here, not before: a moderator's reset that lands first is seen (or makes this
     // retry), so the name it left them is the one a rename frees, never the one it retired
-    const current = (await tx.get(userRef)).data()
+    // An account being deleted takes no profile, nor a name, from a save that was already on its
+    // way (it asked Auth before the deletion finished): deleteAccount marks the uid first
+    const [profile, leaving] = await Promise.all([tx.get(userRef), tx.get(db.doc(`accountDeletions/${uid}`))])
+    if (leaving.exists) throw new HttpsError('unauthenticated', 'Sign in first.')
+    const current = profile.data()
     const lower = penName ? tidyPenName(penName).toLowerCase() : undefined
     const nameRef = lower ? db.doc(`penNames/${lower}`) : undefined
     const oldLower = typeof current?.penNameLower === 'string' ? current.penNameLower : undefined
     const oldRef = nameRef && oldLower && oldLower !== lower ? db.doc(`penNames/${oldLower}`) : undefined
     // A name drawn the same as another ("Јоу" in Cyrillic for "Joy", "OʼNeil" for "O'Neil") is
-    // that name, someone else's or retired. Not read for the name they already go by: one saved
-    // before copies were read stays theirs
-    const shape = penName && lower !== oldLower ? penNameShape(penName) : undefined
-    const shapeRef = shape && shape !== lower ? db.doc(`penNames/${shape}`) : undefined
-    const [claim, oldClaim, copied] = await Promise.all(
-      [nameRef, oldRef, shapeRef].map(async (ref) => (ref ? (await tx.get(ref)).data() : undefined)),
+    // that name, someone else's or retired, whichever spelling came first: penNameShapes holds
+    // what each name passes for, and penNames the keys of names saved before it did
+    const shape = penName ? shapeOf(penName) : undefined
+    const shapeRef = shape ? db.doc(`penNameShapes/${shape}`) : undefined
+    const copiedRef = shape && shape !== lower ? db.doc(`penNames/${shape}`) : undefined
+    const oldShape = nameRef ? shapeOf(current?.penName) : undefined
+    const oldShapeRef = oldShape && oldShape !== shape ? db.doc(`penNameShapes/${oldShape}`) : undefined
+    const [claim, oldClaim, shaped, copied, oldShaped] = await Promise.all(
+      [nameRef, oldRef, shapeRef, copiedRef, oldShapeRef].map(async (ref) => (ref ? (await tx.get(ref)).data() : undefined)),
     )
-    // A name a moderator retired (Reset profile) has no owner, and nobody gets it back
-    if ([claim, copied].some((record) => record?.retired === true)) throw new HttpsError('invalid-argument', 'pen-name', { problem: 'unkind' })
-    if ([claim, copied].some((record) => record?.uid && record.uid !== uid)) throw new HttpsError('already-exists', 'pen-name', { problem: 'taken' })
+    // A name a moderator retired (Reset profile) has no owner, and nobody gets it back. Its copies
+    // aren't read for the name they already go by: one saved before copies were read stays theirs
+    const problem = barredBy(lower !== oldLower ? [claim, shaped, copied] : [claim], uid)
+    if (problem === 'unkind') throw new HttpsError('invalid-argument', 'pen-name', { problem: 'unkind' })
+    if (problem === 'taken') throw new HttpsError('already-exists', 'pen-name', { problem: 'taken' })
 
     if (oldRef && mayRelease(oldClaim, uid)) tx.delete(oldRef)
     if (nameRef) tx.set(nameRef, { uid })
+    if (oldShapeRef && mayRelease(oldShaped, uid)) tx.delete(oldShapeRef)
+    // Theirs unless someone else's name already passes for it (only a name they kept, as above)
+    if (shapeRef && !barredBy([shaped, copied], uid)) tx.set(shapeRef, { uid })
 
     const now = FieldValue.serverTimestamp()
     tx.set(

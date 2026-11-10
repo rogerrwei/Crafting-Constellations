@@ -28,7 +28,12 @@ export const Chat = () => {
   // Which chat I'm leaving: another opened from the rail meanwhile keeps this page mounted, and
   // isn't the one being left
   const [leaving, setLeaving] = useState<string | null>(null)
-  const [error, setError] = useState<string | null>(null)
+  // Why the last Leave didn't go through, with the chat it was pressed in: another opened from the
+  // rail keeps this page mounted, and starts with nothing said. Coming back doesn't bring it back
+  // either, or it would be read out again as if it had just failed
+  const [refusal, setRefusal] = useState<{ at: string; error: string } | null>(null)
+  if (refusal && refusal.at !== chatId) setRefusal(null)
+  const error = refusal?.at === chatId ? refusal.error : null
 
   // Found among my chats, not by its document: that's refused once I've left (Back
   // after leaving, an old notice). Listeners close before leaving, so the rules
@@ -56,7 +61,7 @@ export const Chat = () => {
   const leave = async () => {
     const from = location.pathname
     setLeaving(chatId)
-    setError(null)
+    setRefusal(null)
     try {
       await new Promise((r) => setTimeout(r, 0))
       await leaveChat(chatId, uid)
@@ -64,7 +69,8 @@ export const Chat = () => {
       // stay on the page they chose, and the chat drops from the rail
       if (currentPath() === from) return navigate('/messages')
     } catch (e) {
-      if (currentPath() === from) setError(describeError(e))
+      // Said only on this chat, and only if they're on it when the answer lands
+      if (currentPath() === from) setRefusal({ at: chatId, error: describeError(e) })
     }
     // Done, so this chat shows as it now is, whether they're still on it or come back to it later
     setLeaving((current) => (current === chatId ? null : current))

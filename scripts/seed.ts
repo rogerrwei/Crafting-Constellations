@@ -14,6 +14,7 @@ import { initializeApp } from 'firebase-admin/app'
 import { getAuth } from 'firebase-admin/auth'
 import { FieldValue, getFirestore, Timestamp } from 'firebase-admin/firestore'
 import { getStorage } from 'firebase-admin/storage'
+import { shapeOf } from '../functions/src/profilePolicy.js'
 
 const PROJECT_ID = 'demo-crafting-constellations'
 const SAMPLE_PASSWORD = 'sample-password-only-for-emulator'
@@ -170,6 +171,8 @@ const keepRealProfiles = async () => {
       await d.ref.set(d.data())
       const lower = d.data().penNameLower
       if (typeof lower === 'string') await db.doc(`penNames/${lower}`).set({ uid: d.id })
+      const shape = shapeOf(d.data().penName)
+      if (shape) await db.doc(`penNameShapes/${shape}`).set({ uid: d.id })
     }
     if (real.length > 0) console.log(`  kept ${real.length} real profile(s)`)
   }
@@ -196,6 +199,7 @@ const seedPeople = async () => {
 
     const lower = p.penName.toLowerCase()
     await db.doc(`penNames/${lower}`).set({ uid: p.uid })
+    await db.doc(`penNameShapes/${shapeOf(p.penName) ?? lower}`).set({ uid: p.uid })
     await db.doc(`users/${p.uid}`).set({
       penName: p.penName,
       penNameLower: lower,

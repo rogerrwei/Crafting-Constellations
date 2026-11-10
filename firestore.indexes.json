@@ -48,6 +48,8 @@
     { "collectionGroup": "posts", "fieldPath": "body", "indexes": [] },
     { "collectionGroup": "comments", "fieldPath": "text", "indexes": [] },
     { "collectionGroup": "messages", "fieldPath": "text", "indexes": [] },
-    { "collectionGroup": "modQueue", "fieldPath": "snapshot", "indexes": [] }
+    { "collectionGroup": "modQueue", "fieldPath": "snapshot", "indexes": [] },
+    { "collectionGroup": "counterEvents", "fieldPath": "expireAt", "ttl": true, "indexes": [] },
+    { "collectionGroup": "accountDeletions", "fieldPath": "expireAt", "ttl": true, "indexes": [] }
   ]
 }

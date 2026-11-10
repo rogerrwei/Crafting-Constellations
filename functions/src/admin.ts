@@ -1,13 +1,15 @@
-import { FieldValue, type DocumentData, type QueryDocumentSnapshot, type Transaction } from 'firebase-admin/firestore'
+import { FieldValue, type DocumentData, type DocumentReference, type QueryDocumentSnapshot, type Timestamp, type Transaction } from 'firebase-admin/firestore'
 import { defineList } from 'firebase-functions/params'
 import { HttpsError, onCall, type CallableRequest } from 'firebase-functions/v2/https'
+import { onSchedule } from 'firebase-functions/v2/scheduler'
 import { approvalOf, crisisOnPublish, leftAsIs, licenceOpen, moderatorNote, outcomeOf, removalOf, type Outcome, type Removal } from './adminPolicy.js'
-import { auth, db, logAction, NOT_FOUND, snapshotOf } from './app.js'
+import { auth, closeAll, db, logAction, logActionIn, NOT_FOUND, snapshotOf } from './app.js'
 import { userOrNone } from './localBackendPolicy.js'
-import { checkPenName, suggestPenName } from './moderation/index.js'
+import { checkPenName } from './moderation/index.js'
 import { applyNotices, planNotices } from './notify.js'
 import { callable } from './options.js'
-import { reportedName, resetNames } from './profilePolicy.js'
+import { freeName } from './profile.js'
+import { reportedName, reportedShape, resetNames, shapeOf } from './profilePolicy.js'
 
 const ADMIN_EMAILS = defineList('ADMIN_EMAILS', { default: [] })
 
@@ -49,26 +51,37 @@ const removedByModerator = (now: FieldValue) => ({ status: 'removed', removedBy:
 
 // Reset a reported profile to a quiet generated name and clear the note. The name
 // it was reported under is retired, not freed, so nobody can take it again, the
-// person included, even if they've renamed since (see resetNames). The retired
-// record is the name alone: account deletion leaves it, and nothing in it points
-// back at them. Gives the new name, or null when the account is gone.
+// person included, even if they've renamed since (see resetNames), and so is the
+// name it passes for (penNameShapes), so no lookalike spelling of it can be had
+// either. The retired records are the name alone: account deletion leaves them,
+// and nothing in them points back at them. Gives the new name, or null when the
+// account is gone. With no free name to give, changes nothing and says so.
 const resetProfile = async (tx: Transaction, queued: DocumentData, now: FieldValue) => {
   const uid: string = queued.authorUid
   const profile = (await tx.get(db.doc(`users/${uid}`))).data()
   if (!profile) return null
   const current = typeof profile.penNameLower === 'string' && profile.penNameLower ? profile.penNameLower : undefined
   const reported = reportedName(queued.authorPenName, current)
-  // Every read before the first write: who holds each name now, then a free one to give them
-  const keys = [...new Set([reported, current])].filter((key): key is string => key !== undefined)
-  const records = new Map(await Promise.all(keys.map(async (key) => [key, (await tx.get(db.doc(`penNames/${key}`))).data()] as const)))
-  let name = suggestPenName()
-  for (let i = 0; i < 8 && (records.has(name.toLowerCase()) || (await tx.get(db.doc(`penNames/${name.toLowerCase()}`))).exists); i++) {
-    name = `${suggestPenName()} ${Math.floor(Math.random() * 90 + 10)}`
-  }
-  const { retire, free } = resetNames(uid, reported, current, records)
-  if (retire) tx.set(db.doc(`penNames/${retire}`), { retired: true })
-  if (free) tx.delete(db.doc(`penNames/${free}`))
+  const shapes = { reported: reportedShape(queued.authorPenName, profile.penName), current: shapeOf(profile.penName) }
+  // Every read before the first write: who holds each name and shape now, then a free one to give them
+  const readAll = async (collection: string, keys: (string | undefined)[]) =>
+    new Map(
+      await Promise.all(
+        [...new Set(keys)].filter((key): key is string => key !== undefined).map(async (key) => [key, (await tx.get(db.doc(`${collection}/${key}`))).data()] as const),
+      ),
+    )
+  const [records, shapeRecords] = await Promise.all([readAll('penNames', [reported, current]), readAll('penNameShapes', [shapes.reported, shapes.current])])
+  // Not one of the names being retired or freed here, however its records read
+  const name = await freeName(tx, new Set([...records.keys(), ...shapeRecords.keys()]))
+  if (!name) throw new HttpsError('resource-exhausted', 'pen-name', { problem: 'no-free-name' })
+  const names = resetNames(uid, reported, current, records)
+  const passesFor = resetNames(uid, shapes.reported, shapes.current, shapeRecords)
+  if (names.retire) tx.set(db.doc(`penNames/${names.retire}`), { retired: true })
+  if (names.free) tx.delete(db.doc(`penNames/${names.free}`))
+  if (passesFor.retire) tx.set(db.doc(`penNameShapes/${passesFor.retire}`), { retired: true })
+  if (passesFor.free) tx.delete(db.doc(`penNameShapes/${passesFor.free}`))
   tx.set(db.doc(`penNames/${name.toLowerCase()}`), { uid })
+  tx.set(db.doc(`penNameShapes/${shapeOf(name) ?? name.toLowerCase()}`), { uid })
   tx.update(db.doc(`users/${uid}`), { penName: name, penNameLower: name.toLowerCase(), note: '', updatedAt: now })
   return name
 }
@@ -80,12 +93,17 @@ const ignoreMissing = (error: { code?: number }) => {
 // Writing keeps the name and mark it went out with, but a reset is there to take the
 // name out of view, and a revoke the mark: put what they show now on everything they
 // wrote (held writing too, so approving it later can't bring the old back) and on the
-// notices they caused
-const refreshWriting = async (uid: string, shown: { penName?: string; pro?: boolean }) => {
+// notices they caused. Given a time, only on what was written by then: anything newer
+// went out with what they showed when it did
+const refreshWriting = async (uid: string, shown: { penName?: string; pro?: boolean }, by?: Timestamp) => {
   const [writing, notices] = await Promise.all([
     Promise.all(['posts', 'comments', 'messages'].map((group) => db.collectionGroup(group).where('authorUid', '==', uid).get())),
     db.collectionGroup('notices').where('actorUid', '==', uid).get(),
   ])
+  const writtenBy = (d: QueryDocumentSnapshot) => {
+    const at = d.get('createdAt')
+    return !by || typeof at?.toMillis !== 'function' || at.toMillis() <= by.toMillis()
+  }
   const writer = db.bulkWriter()
   // Only what it shows differently. Writing still pending has nothing on it yet, and
   // takes what they show now as it goes out
@@ -94,15 +112,46 @@ const refreshWriting = async (uid: string, shown: { penName?: string; pro?: bool
       const was = d.get(`${snapshot}.${field}`)
       return was !== undefined && was !== value
     })
-    return stale.length === 0 ? [] : [writer.update(d.ref, Object.fromEntries(stale.map(([field, value]) => [`${snapshot}.${field}`, value])))]
+    return stale.length === 0 || !writtenBy(d) ? [] : [writer.update(d.ref, Object.fromEntries(stale.map(([field, value]) => [`${snapshot}.${field}`, value])))]
   }
   const results = [
     ...writing.flatMap((s) => s.docs).flatMap(refresh('author')),
     ...notices.docs.flatMap(refresh('actor')),
   ].map((result) => result.catch(ignoreMissing)) // deleted meanwhile, with someone else's account
-  await writer.close()
-  await Promise.all(results)
+  await closeAll(writer, results)
 }
+
+// A reset's new name goes on the writing they already had out after the decision is in, and that
+// can fail part way, or the process can stop. So the decision keeps what is left to do on its
+// queue entry (writingRefresh), and this does it, then says so: safe to run again, and run until
+// it is done, by Remove pressed again and by finishRefreshes. Only the refresh that is still the
+// entry's is marked done: the profile may have been reported and reset again meanwhile
+const finishRefresh = async (queueRef: DocumentReference) => {
+  const queued = (await queueRef.get()).data()
+  const refresh = queued?.writingRefresh
+  if (!queued || refresh?.state !== 'pending') return
+  await refreshWriting(queued.authorUid, { penName: refresh.penName }, refresh.at)
+  await db.runTransaction(async (tx) => {
+    const now = (await tx.get(queueRef)).get('writingRefresh')
+    if (now?.state === 'pending' && now.at?.isEqual?.(refresh.at)) tx.update(queueRef, { 'writingRefresh.state': 'done' })
+  })
+}
+
+// Resets whose refresh was left undone (a failure part way, a stop), finished. Only ones left a
+// while, so a Remove still at its own isn't doubled. Each is tried; a failure waits for the next round
+export const finishRefreshes = async (leftForMs = 2 * 60_000) => {
+  const pending = await db.collection('modQueue').where('writingRefresh.state', '==', 'pending').get()
+  const cutoff = pending.readTime.toMillis() - leftForMs
+  const left = pending.docs.filter((d) => (d.get('writingRefresh.at')?.toMillis?.() ?? 0) <= cutoff)
+  const failed = (await Promise.allSettled(left.map((d) => finishRefresh(d.ref)))).filter((result) => result.status === 'rejected')
+  if (failed.length > 0) throw (failed[0] as PromiseRejectedResult).reason
+  return left.length
+}
+
+// On Cloud Functions; the local backend runs finishRefreshes itself
+export const finishResets = onSchedule('every 10 minutes', async () => {
+  await finishRefreshes()
+})
 
 // ---------- review queue ----------
 
@@ -188,10 +237,12 @@ const takeDown = async (tx: Transaction, queued: DocumentData, now: FieldValue):
 
 export const removeContent = onCall<{ queueId: string; note?: string }>(callable(), async (request) => {
   const actor = await requireAdmin(request)
-  const queueRef = db.doc(`modQueue/${str(request.data?.queueId, 'queueId', 1500)}`)
+  const queueId = str(request.data?.queueId, 'queueId', 1500)
+  const queueRef = db.doc(`modQueue/${queueId}`)
   const note = moderatorNote(request.data?.note)
 
-  // One transaction, so a second moderator (or a retry) finds the entry resolved and does nothing twice
+  // One transaction, so a second moderator (or a retry) finds the entry resolved and does nothing
+  // twice, and the decision is never without its line in the audit log
   const done = await db.runTransaction(async (tx) => {
     const queued = (await tx.get(queueRef)).data()
     if (!queued) throw new HttpsError('not-found', 'queue item')
@@ -199,19 +250,27 @@ export const removeContent = onCall<{ queueId: string; note?: string }>(callable
     notTheirOwn(actor, queued.authorUid)
     const now = FieldValue.serverTimestamp()
     const { removal, penName } = await takeDown(tx, queued, now)
-    tx.update(queueRef, { state: 'resolved', resolution: removal === 'withdrawn' ? 'withdrawn' : 'removed', resolvedBy: actor, resolvedAt: now, updatedAt: now })
+    tx.update(queueRef, {
+      state: 'resolved',
+      resolution: removal === 'withdrawn' ? 'withdrawn' : 'removed',
+      resolvedBy: actor,
+      resolvedAt: now,
+      updatedAt: now,
+      // What the reset leaves to do: the new name on what they already wrote (finishRefresh)
+      ...(penName ? { writingRefresh: { penName, at: now, state: 'pending' } } : {}),
+    })
     // Only the writer of something a moderator took down hears about it
     if (removal === 'remove') {
       tx.set(db.collection(`users/${queued.authorUid}/notices`).doc(), notice('removed', { contentPath: queued.contentPath, ...(note ? { note } : {}) }))
     }
-    return { removal, authorUid: queued.authorUid as string, penName }
+    logActionIn(tx, actor, 'removeContent', queueId, { note, removal })
+    return { removal }
   })
 
-  if (!done) return { ok: true, outcome: 'already-resolved' }
-  await logAction(actor, 'removeContent', request.data.queueId, { note, removal: done.removal })
-  // Once the reset is in: writing that goes out from then on takes the new name itself
-  if (done.penName) await refreshWriting(done.authorUid, { penName: done.penName })
-  return { ok: true, outcome: outcomeOf(done.removal) }
+  // Decided here or before: a reset's refresh an earlier try left undone is finished now, without
+  // a second reset or notice. Writing that goes out from now on takes the new name itself
+  await finishRefresh(queueRef)
+  return done ? { ok: true, outcome: outcomeOf(done.removal) } : { ok: true, outcome: 'already-resolved' }
 })
 
 // ---------- people ----------

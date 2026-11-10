@@ -26,7 +26,11 @@ service cloud.firestore {
       return claim('banned') != true
         && !exists(/databases/$(database)/documents/bans/$(me()));
     }
-    function canWrite() { return signedIn() && notBanned(); }
+    // An account being deleted (deleteAccount marks it first) writes nothing more: a tab left
+    // open holds a token that outlives the account by up to an hour, and the purge must not be
+    // undone behind it (a membership while it runs, settings or a report once it's done)
+    function notLeaving() { return !exists(/databases/$(database)/documents/accountDeletions/$(me())); }
+    function canWrite() { return signedIn() && notBanned() && notLeaving(); }
     function hasProfile() { return exists(/databases/$(database)/documents/users/$(me())); }
     function isMember(gid) {
       return exists(/databases/$(database)/documents/groups/$(gid)/members/$(me()));
@@ -93,6 +97,8 @@ service cloud.firestore {
     }
 
     match /penNames/{name}      { allow read, write: if false; }
+    match /penNameShapes/{name} { allow read, write: if false; }   // saveProfile + Reset profile only
+    match /accountDeletions/{uid} { allow read, write: if false; } // deleteAccount only
     match /constellations/{cid} { allow read: if signedIn(); allow write: if false; }
 
     // ---------- groups ----------
