@@ -6,7 +6,7 @@ import { db, NOT_FOUND } from './app.js'
 // gRPC status for create() on a document that is already there
 const ALREADY_EXISTS = 6
 
-// Long enough to outlast any retry of the event; the TTL policy on expireAt clears them after
+// Long enough to outlast any retry of the event; housekeeping removes them after
 const MARKER_DAYS = 7
 
 const existed = (snap: { exists: boolean } | undefined) => Number(snap?.exists ?? false)

@@ -1,7 +1,6 @@
 import { FieldValue, type DocumentData, type DocumentReference, type QueryDocumentSnapshot, type Timestamp, type Transaction } from 'firebase-admin/firestore'
 import { defineList } from 'firebase-functions/params'
 import { HttpsError, onCall, type CallableRequest } from 'firebase-functions/v2/https'
-import { onSchedule } from 'firebase-functions/v2/scheduler'
 import { approvalOf, crisisOnPublish, leftAsIs, licenceOpen, moderatorNote, outcomeOf, removalOf, type Outcome, type Removal } from './adminPolicy.js'
 import { auth, closeAll, db, logAction, logActionIn, NOT_FOUND, snapshotOf } from './app.js'
 import { userOrNone } from './localBackendPolicy.js'
@@ -147,11 +146,6 @@ export const finishRefreshes = async (leftForMs = 2 * 60_000) => {
   if (failed.length > 0) throw (failed[0] as PromiseRejectedResult).reason
   return left.length
 }
-
-// On Cloud Functions; the local backend runs finishRefreshes itself
-export const finishResets = onSchedule('every 10 minutes', async () => {
-  await finishRefreshes()
-})
 
 // ---------- review queue ----------
 
