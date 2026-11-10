@@ -17,4 +17,5 @@ export {
   setAdmin,
   bootstrapAdmin,
   createGroup,
+  finishResets,
 } from './admin.js'

@@ -1,17 +1,19 @@
-import { FieldValue, type DocumentReference, type Query } from 'firebase-admin/firestore'
+import { FieldValue, Timestamp, type DocumentReference, type Query } from 'firebase-admin/firestore'
 import { HttpsError, onCall } from 'firebase-functions/v2/https'
 import { confirmMatches, isPairOf, isRecentSignIn, pairOfDmPath, underPath } from './accountPolicy.js'
-import { auth, db, logAction, storage } from './app.js'
+import { auth, closeAll, db, logAction, storage } from './app.js'
 import { callable } from './options.js'
+
+// How long the mark that an account is leaving outlasts the deletion: longer than a call already on
+// its way, or a sign-in token (an hour), can still act for it. Firestore's TTL policy removes it after
+const LEAVING_FOR_MS = 24 * 60 * 60_000
 
 const refsOf = async (query: Query) => (await query.get()).docs.map((d) => d.ref)
 
 // Plain documents (no subcollections), in parallel; rejects if any delete fails
 const deleteAll = async (refs: DocumentReference[]) => {
   const writer = db.bulkWriter()
-  const results = refs.map((ref) => writer.delete(ref))
-  await writer.close()
-  await Promise.all(results)
+  await closeAll(writer, refs.map((ref) => writer.delete(ref)))
   return refs.length
 }
 
@@ -22,18 +24,20 @@ const deleteTrees = async (refs: DocumentReference[]) => {
 
 // Everything a person leaves behind, except moderation evidence (bans, the
 // audit log, reports others filed, pen names a moderator retired: those hold
-// no uid, so they stay blocked). Safe to run again after a partial failure.
+// no uid, so they stay blocked), and deleteAccount's mark that they are leaving,
+// which expires. Safe to run again after a partial failure.
 export const purgeAccount = async (uid: string) => {
   // 1. Cut off writing first: rules need a membership, a connection, a chat seat or a profile
-  const [memberships, connections, friendships, penNames, threadDocs, chats] = await Promise.all([
+  const [memberships, connections, friendships, penNames, shapes, threadDocs, chats] = await Promise.all([
     refsOf(db.collectionGroup('members').where('uid', '==', uid)),
     refsOf(db.collection('connections').where('uids', 'array-contains', uid)),
     refsOf(db.collection('friendships').where('uids', 'array-contains', uid)),
     refsOf(db.collection('penNames').where('uid', '==', uid)),
+    refsOf(db.collection('penNameShapes').where('uid', '==', uid)),
     refsOf(db.collection('dms').where('uids', 'array-contains', uid)),
     refsOf(db.collection('chats').where('uids', 'array-contains', uid)),
   ])
-  const access = await deleteAll([...memberships, ...connections, ...friendships, ...penNames])
+  const access = await deleteAll([...memberships, ...connections, ...friendships, ...penNames, ...shapes])
   // Private group chats carry on for everyone else; their own lines go in step 4
   await Promise.all(chats.map((ref) => ref.update({ uids: FieldValue.arrayRemove(uid) })))
   await db.recursiveDelete(db.doc(`users/${uid}`)) // with private/settings and notices
@@ -112,13 +116,13 @@ export const deleteAccount = onCall<{ confirm?: string }>(
       throw new HttpsError('invalid-argument', 'confirm', { problem: 'confirm' })
     }
 
+    // Before anything goes. A save already on its way (it asked Auth before this finished) reads it
+    // and gives up, and the rules refuse a tab's writes, so nothing they had comes back after the purge
+    await db.doc(`accountDeletions/${uid}`).set({ at: FieldValue.serverTimestamp(), expireAt: Timestamp.fromMillis(Date.now() + LEAVING_FOR_MS) })
     const counts = await purgeAccount(uid)
     await auth.deleteUser(uid).catch((error: { code?: string }) => {
       if (error.code !== 'auth/user-not-found') throw error
     })
-    // Once the profile goes, a tab left open is sent to choose a pen name, and while Auth still knew
-    // them saveProfile let it. Nothing can now (it asks Auth), so whatever that let them do goes too
-    if ((await db.doc(`users/${uid}`).get()).exists) await purgeAccount(uid)
     await logAction(uid, 'deleteAccount', uid, counts)
     return { ok: true }
   },

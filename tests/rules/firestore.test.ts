@@ -93,6 +93,42 @@ describe('profiles', () => {
     await assertSucceeds(setDoc(doc(alice(), 'users/alice/private/settings'), { reduceMotion: true }))
     await assertFails(getDoc(doc(bob(), 'users/alice/private/settings')))
   })
+
+  it('pen-name claims, what names pass for, and deletion marks are functions’ alone', async () => {
+    await seed(async (db) => {
+      await setDoc(doc(db, 'penNameShapes/bob'), { uid: 'bob' })
+      await setDoc(doc(db, 'accountDeletions/carl'), { at: new Date() })
+    })
+    for (const path of ['penNames/bob', 'penNameShapes/bob', 'accountDeletions/carl']) {
+      await assertFails(getDoc(doc(alice(), path)))
+      await assertFails(getDoc(doc(admin(), path)))
+      await assertFails(setDoc(doc(alice(), path), { uid: 'alice' }))
+    }
+    await assertFails(deleteDoc(doc(carl(), 'accountDeletions/carl')))
+  })
+
+  it('an account being deleted writes nothing more, though its token is still good', async () => {
+    const settings = () => setDoc(doc(alice(), 'users/alice/private/settings'), { reduceMotion: true })
+    const report = () => setDoc(doc(collection(alice(), 'reports')), {
+      reporterUid: 'alice', contentPath: `${GROUP}/posts/pub`, reason: 'other', createdAt: serverTimestamp(),
+    })
+    const join = () => setDoc(doc(alice(), `${GROUP}/members/alice`), { uid: 'alice', joinedAt: serverTimestamp() })
+    await seed(async (db) => {
+      await deleteDoc(doc(db, `${GROUP}/members/alice`))
+      await setDoc(doc(db, 'accountDeletions/alice'), { at: new Date() })
+    })
+    await assertFails(settings())
+    await assertFails(report())
+    await assertFails(join())
+    // Everyone else still can, and so could they without the mark
+    await assertSucceeds(setDoc(doc(bob(), 'users/bob/private/settings'), { reduceMotion: true }))
+    await seed(async (db) => {
+      await deleteDoc(doc(db, 'accountDeletions/alice'))
+    })
+    await assertSucceeds(settings())
+    await assertSucceeds(report())
+    await assertSucceeds(join())
+  })
 })
 
 describe('membership', () => {

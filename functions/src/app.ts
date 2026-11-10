@@ -1,6 +1,6 @@
 import { initializeApp } from 'firebase-admin/app'
 import { getAuth } from 'firebase-admin/auth'
-import { FieldValue, getFirestore } from 'firebase-admin/firestore'
+import { FieldValue, getFirestore, type BulkWriter, type Transaction } from 'firebase-admin/firestore'
 import { getStorage } from 'firebase-admin/storage'
 
 initializeApp()
@@ -13,8 +13,28 @@ export const storage = getStorage()
 export const NOT_FOUND = 5
 
 // Audit log: who did what to whom (ids only)
+const actionOf = (actorUid: string, action: string, target: string, details: Record<string, unknown>) => ({
+  actorUid,
+  action,
+  target,
+  details,
+  at: FieldValue.serverTimestamp(),
+})
 export const logAction = (actorUid: string, action: string, target: string, details: Record<string, unknown> = {}) =>
-  db.collection('adminActions').add({ actorUid, action, target, details, at: FieldValue.serverTimestamp() })
+  db.collection('adminActions').add(actionOf(actorUid, action, target, details))
+// The same, in the transaction that makes the decision: one is never without the other
+export const logActionIn = (tx: Transaction, actorUid: string, action: string, target: string, details: Record<string, unknown> = {}) =>
+  tx.set(db.collection('adminActions').doc(), actionOf(actorUid, action, target, details))
+
+// Closes a BulkWriter and waits for its operations, each handled from the start: one that fails
+// while close() flushes would otherwise sit as an unhandled rejection, which ends a Node process
+// (the local backend). Rejects with the first failure, once every operation has settled
+export const closeAll = async (writer: BulkWriter, results: Promise<unknown>[]) => {
+  const settled = Promise.allSettled(results)
+  await writer.close()
+  const failed = (await settled).find((result): result is PromiseRejectedResult => result.status === 'rejected')
+  if (failed) throw failed.reason
+}
 
 // The nine pigments of the source sheet (mirrors src/wash/pigments.ts)
 export const PIGMENTS = ['paynesBlue', 'graphite', 'fresco', 'paynes', 'titanium', 'caliente', 'neutral', 'cool', 'warm'] as const
